@@ -50,6 +50,8 @@ float minDist = .75; // minimum distance r between samples
 bool viz = false;
 polyscope::SurfaceMesh* psMesh;
 
+std::vector<std::vector<SurfacePoint>> global_streamlines;//Annika added: variable to hold streamlines for saving
+
 bool hasTextureCoordinates(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) return false;
@@ -257,10 +259,12 @@ FaceData<Vector2> readFaceField(const std::string& filename,
             double x, y, z;
             iss >> x >> y >> z;
             Vector3 v    = {x, y, z}; // extrinsic vector
+            Vector3 vn=v.normalize();
             Face f       = mesh.face(iF);
             Vector3 fX   = geom.faceTangentBasis[f][0];
             Vector3 fY   = geom.faceTangentBasis[f][1];
-            faceField[f] = {dot(fX, v), dot(fY, v)};
+            Vector2 local={dot(fX, vn), dot(fY, vn)};
+            faceField[f] = local;//.normalize();
             iF++;
         }
 
@@ -271,6 +275,78 @@ FaceData<Vector2> readFaceField(const std::string& filename,
         throw std::runtime_error("Could not open file: " + filename);
     }
 }
+
+std::vector<Face> getAllPossibleFaces(SurfacePoint p) {
+    std::vector<Face> faces;
+    
+    if (p.type == SurfacePointType::Face) {
+        if (p.face != Face()) faces.push_back(p.face);
+    } 
+    else if (p.type == SurfacePointType::Edge) {
+        // A halfedge is "interior" if it has a real face attached
+        Halfedge he = p.edge.halfedge();
+        if (he.isInterior()) faces.push_back(he.face());
+        
+        Halfedge twin = he.twin();
+        if (twin.isInterior()) faces.push_back(twin.face());
+    } 
+    else if (p.type == SurfacePointType::Vertex) {
+        // Vertex::adjacentFaces() naturally only returns valid (interior) faces
+        for (Face f : p.vertex.adjacentFaces()) {
+            faces.push_back(f);
+        }
+    }
+    return faces;
+}
+
+// Annika added: Function to find the face ID for a segment
+size_t getSegmentFaceID(SurfacePoint pStart, SurfacePoint pEnd) {
+    // 1. Easy case: One of them is explicitly inside a face
+    if (pStart.type == SurfacePointType::Face) return pStart.face.getIndex();
+    if (pEnd.type == SurfacePointType::Face) return pEnd.face.getIndex();
+
+    // 2. Both are on edges/vertices: Find a common face
+    auto startFaces = getAllPossibleFaces(pStart);
+    auto endFaces = getAllPossibleFaces(pEnd);
+
+    for (Face fS : startFaces) {
+        for (Face fE : endFaces) {
+            if (fS == fE && fS != Face()) {
+                return fS.getIndex();
+            }
+        }
+    }
+
+    // 3. Fallback: GeometryCentral SurfacePoints usually carry a 
+    // "representative" face even if they are on an edge.
+    if (pStart.face != Face()) return pStart.face.getIndex();
+    
+    return std::numeric_limits<size_t>::max(); // Should not happen on manifold mesh
+}
+
+//Annika added: saving streamlines
+bool save_streamlines(std::string filename, std::vector<std::vector<SurfacePoint>> streamlines) {
+    std::ofstream outFile(filename);
+    if (!outFile.is_open()) return false;
+
+    for (const auto& curve : streamlines) {
+        if (curve.size() < 2) continue; 
+
+        for (size_t i = 0; i < curve.size() - 1; ++i) {
+            Vector3 p = curve[i].interpolate(geom->vertexPositions);
+            size_t fid = getSegmentFaceID(curve[i], curve[i+1]);
+            
+            outFile << p.x << " " << p.y << " " << p.z << " " << fid << " ";
+        }
+        
+        // write last point of the curve 
+        Vector3 lastP = curve.back().interpolate(geom->vertexPositions);
+        outFile << lastP.x << " " << lastP.y << " " << lastP.z << "\n";
+    }
+    outFile.close();
+    return true;
+}
+
 
 // A user-defined callback, for creating control panels (etc)
 // Use ImGUI commands to build whatever you want here, see
@@ -290,6 +366,21 @@ void myCallback() {
         std::vector<std::vector<SurfacePoint>> streamlines =
             traceManyStreamlines(*mesh, *geom, faceField, size_t(nSym), opt,
                                  pdOpt);
+
+        global_streamlines=streamlines;//Annika added
+
+
+        for (const auto& curve : streamlines) {
+            for (size_t i = 0; i < curve.size() - 1; ++i) {
+                Vector3 start, end;
+                SurfacePoint pStart = curve[i];
+                SurfacePoint pEnd = curve[i+1];
+                
+                start = pStart.interpolate(geom->vertexPositions);
+                end   = pEnd.interpolate(geom->vertexPositions);
+            }
+        }
+
         drawCurves("streamlines", *mesh, *geom, streamlines);
         if (saveOBJ) {
             writeCurvesToOBJ(*mesh, *geom, streamlines, objName);
@@ -315,6 +406,9 @@ void myCallback() {
     ImGui::Checkbox("Save to OBJ", &saveOBJ);
     ImGui::SameLine();
     ImGui::Checkbox("Save field", &saveField);
+    if(ImGui::Button("Save streamlines")){//Annika added: button to save streamlines
+        save_streamlines("../liness.strm", global_streamlines);
+    }
 
     if (ImGui::TreeNode("Streamline options")) {
         ImGui::InputFloat("Max streamline length", &maxLen);
@@ -480,10 +574,12 @@ int main(int argc, char** argv) {
     }
 
     if (viz) {
+
         // Register the mesh with polyscope
         psMesh = polyscope::registerSurfaceMesh(
             polyscope::guessNiceNameFromPath(filename), geom->vertexPositions,
             mesh->getFaceVertexList(), polyscopePermutations(*mesh));
+
 
         if (inputFieldArg) {
             drawFaceField(*psMesh, "smooth direction field", *mesh, *geom,
@@ -497,6 +593,8 @@ int main(int argc, char** argv) {
             std::vector<std::vector<SurfacePoint>> streamlines =
                 traceManyStreamlines(*mesh, *geom, faceField, size_t(nSym), opt,
                                      pdOpt);
+
+
             drawCurves("streamlines", *mesh, *geom, streamlines);
             if (saveOBJ) {
                 writeCurvesToOBJ(*mesh, *geom, streamlines, objName);
@@ -531,6 +629,7 @@ int main(int argc, char** argv) {
         std::vector<std::vector<SurfacePoint>> streamlines =
             traceManyStreamlines(*mesh, *geom, faceField, size_t(nSym), opt,
                                  pdOpt);
+    
         if (saveOBJ) {
             writeCurvesToOBJ(*mesh, *geom, streamlines, objName);
         }
